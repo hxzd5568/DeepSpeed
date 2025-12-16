@@ -44,5 +44,14 @@ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers, 
                     f"No datastates engine found! Install from https://github.com/DataStates/datastates-llm. Will fall back to torch.save. Details: {err}"
                 )
                 return TorchCheckpointEngine(config_params)
+        if config_params.datastates_config.enabled_casync:
+            try:
+                from .casync_checkpoint_engine import CasyncEngine
+                return CasyncEngine(deepspeed_config=config_params, rank=dist.get_rank())
+            except ImportError as err:
+                logger.error(
+                    f"No casync engine found! Install from https://github.com/hxzd5568/casync. Will fall back to torch.save. Details: {err}"
+                )
+                return TorchCheckpointEngine(config_params)
 
     return TorchCheckpointEngine(config_params)
