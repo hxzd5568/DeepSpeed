@@ -45,6 +45,9 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         self.ckpt_engine.wait(persist=True)
         self.commit_info = None
         return True
+    
+    def wait(self):
+        self.ckpt_engine.wait(persist=True)
 
     def cleanup(self):
         self.commit(self.commit_info)
