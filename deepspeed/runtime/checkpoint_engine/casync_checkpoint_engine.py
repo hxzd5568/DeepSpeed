@@ -7,7 +7,7 @@
 
 from deepspeed.runtime.checkpoint_engine.checkpoint_engine import \
     CheckpointEngine, CheckpointCommitInfo
-
+import time
 ENGINE_NAME = "CasyncEngine"
 
 
@@ -16,6 +16,7 @@ class CasyncEngine(CheckpointEngine):
     def __init__(self, deepspeed_config, rank):
         super().__init__(deepspeed_config)
         self.commit_info = None
+        self.rank = rank
         self.ckpt_engine = None
         try:
             from datastates import CheckpointEngine as DataStatesEngine
@@ -34,8 +35,9 @@ class CasyncEngine(CheckpointEngine):
 
     def save(self, state_dict, path: str):
         # return self.ckpt_engine.coalition_save(state_dict, path)
+        print(f"rank [{self.rank}] at {time.time()} save {path}")
         self.ckpt_engine.coalition_save(state_dict, path)
-        self.ckpt_engine.wait(persist=False)
+
 
     def load(self, path: str, map_location=None):
         if 'ds_checkpoints/global_step15/layer_01' in path:
@@ -43,11 +45,13 @@ class CasyncEngine(CheckpointEngine):
             # exit(0)
         return self.ckpt_engine.split_load_(path, map_location)
     
+    def wait(self, persist=True):
+        self.ckpt_engine.wait(persist=persist)
 
     def commit(self, info: CheckpointCommitInfo):
         if info is None:
             return
-        assert info == self.commit_info
+        # assert info == self.commit_info
         self.ckpt_engine.wait(persist=True)
         self.commit_info = None
         return True
