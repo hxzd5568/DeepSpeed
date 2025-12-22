@@ -33,10 +33,8 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         return None
 
     def save(self, state_dict, path: str):
-        return self.ckpt_engine.save(state_dict, path)
-
-    def wait(self, persist=True):
-        self.ckpt_engine.wait(persist=persist)
+        self.ckpt_engine.save(state_dict, path)
+        # return self.ckpt_engine.save(state_dict, path)
 
     def load(self, path: str, map_location=None):
         return self.ckpt_engine.load(path, map_location)
@@ -44,10 +42,12 @@ class DataStatesCheckpointEngine(CheckpointEngine):
     def commit(self, info: CheckpointCommitInfo):
         if info is None:
             return
-        assert info == self.commit_info
+        # assert info == self.commit_info
         self.ckpt_engine.wait(persist=True)
         self.commit_info = None
         return True
+    def wait(self, persist=True):
+        self.ckpt_engine.wait(persist=persist)
 
     def cleanup(self):
         self.commit(self.commit_info)

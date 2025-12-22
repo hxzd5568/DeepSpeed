@@ -35,15 +35,18 @@ class CasyncEngine(CheckpointEngine):
 
     def save(self, state_dict, path: str):
         # return self.ckpt_engine.coalition_save(state_dict, path)
-        print(f"rank [{self.rank}] at {time.time()} save {path}")
-        self.ckpt_engine.coalition_save(state_dict, path)
+        if 'model_states' in path:
+            self.ckpt_engine.coalition_save(state_dict, path)
+        else:
+            self.ckpt_engine.save(state_dict, path)
 
 
     def load(self, path: str, map_location=None):
-        if 'ds_checkpoints/global_step15/layer_01' in path:
-            print(path, map_location)
-            # exit(0)
-        return self.ckpt_engine.split_load_(path, map_location)
+        if 'model_states' in path:
+            return self.ckpt_engine.split_load_(path, map_location)
+        else:
+            return self.ckpt_engine.load(path, map_location)
+
     
     def wait(self, persist=True):
         self.ckpt_engine.wait(persist=persist)

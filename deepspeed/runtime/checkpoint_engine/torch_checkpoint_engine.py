@@ -41,3 +41,5 @@ class TorchCheckpointEngine(CheckpointEngine):
     def commit(self, info: CheckpointCommitInfo):
         #logger.info(f"[Torch] Checkpoint {tag} is ready now!")
         return True
+    def wait(self, persist=True):
+        return True
