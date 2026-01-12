@@ -13,13 +13,13 @@ ENGINE_NAME = "DataStatesCheckpointEngine"
 
 class DataStatesCheckpointEngine(CheckpointEngine):
 
-    def __init__(self, deepspeed_config, rank):
+    def __init__(self, deepspeed_config, rank, casync=False):
         super().__init__(deepspeed_config)
         self.commit_info = None
         self.ckpt_engine = None
         try:
             from datastates import CheckpointEngine as DataStatesEngine
-            self.ckpt_engine = DataStatesEngine(deepspeed_config, rank)
+            self.ckpt_engine = DataStatesEngine(deepspeed_config, rank, casync=casync)
         except ImportError:
             raise RuntimeError("Please install DataStates from https://github.com/DataStates/datastates-llm.")
         except Exception as e:
