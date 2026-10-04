@@ -50,6 +50,18 @@ class CheckpointEngine(ABC):
     def is_decoupled(self):
         return False
 
+    def supports_async_load(self):
+        """Whether this engine supports asynchronous optimizer-state loading.
+
+        When True and the ``async_load`` config option is enabled, the staged
+        load API (``engine.load_checkpoint_stage(..., stage=0)``) may start
+        loading the optimizer states in a background thread right after the
+        weights are loaded; ``engine.wait_for_optimizer_states()`` blocks until
+        they are ready. Engines returning False fall back to the synchronous
+        two-stage load.
+        """
+        return False
+
     def set_commit_info(self, info: CheckpointCommitInfo):
         pass
 

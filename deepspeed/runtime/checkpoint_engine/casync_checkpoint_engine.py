@@ -93,5 +93,8 @@ class CasyncEngine(CheckpointEngine):
     def is_decoupled(self):
         return True
 
+    def supports_async_load(self):
+        return True
+
     def preserves_storage_sharing(self):
         return False

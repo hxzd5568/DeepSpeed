@@ -8,6 +8,7 @@ import re
 import stat
 import torch
 import hashlib
+import threading
 from collections import defaultdict, OrderedDict, deque
 from shutil import copyfile
 import gc
@@ -249,6 +250,7 @@ class DeepSpeedEngine(Module):
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
         self.checkpoint_engine = None
+        self._staged_checkpoint_state = None
         self.optimizer = None
         self.basic_optimizer = None
         self.lr_scheduler = None
@@ -3181,6 +3183,203 @@ class DeepSpeedEngine(Module):
             self.optimizer.update_lp_params()
 
         return load_path, client_states
+
+    def load_checkpoint_stage(self,
+                              load_dir,
+                              tag=None,
+                              load_module_strict=True,
+                              load_lr_scheduler_states=True,
+                              custom_load_fn=None,
+                              stage=0):
+        """
+        Two-stage training checkpoint loading.
+
+        Forward/backward only needs the model weights, while the optimizer
+        states are only required right before the first ``optimizer.step()``.
+        This API splits ``load_checkpoint`` into two stages so that training
+        work can overlap with the (potentially large) optimizer-state load:
+
+        * ``stage=0`` loads the model weights and returns
+          ``(load_path, client_state)`` exactly like ``load_checkpoint``,
+          except that optimizer states are not loaded. If ``async_load`` is
+          enabled in the DeepSpeed config and the active checkpoint engine
+          supports asynchronous loads (``checkpoint_engine.supports_async_load()``),
+          loading of the optimizer states is started in a background thread and
+          this call returns immediately.
+        * ``stage=1`` loads the optimizer states. When async loading is active
+          it waits for the background thread; otherwise it performs the load
+          synchronously. It is safe to call it more than once.
+
+        Alternatively, call ``wait_for_optimizer_states()`` right before the
+        first update to block until the optimizer states are ready (with async
+        loading disabled, this performs the ``stage=1`` load synchronously).
+
+        Arguments:
+            load_dir: Required. Directory to load the checkpoint from.
+            tag: Checkpoint tag used as a unique identifier for checkpoint, if
+                not provided will attempt to load tag in 'latest' file.
+            load_module_strict: Optional. Boolean to strictly enforce that the
+                keys in state_dict of module and checkpoint match.
+            load_lr_scheduler_states: Optional. Boolean to add the learning rate
+                scheduler states from Checkpoint.
+            custom_load_fn: Optional. Custom model load function.
+            stage: Optional. 0 loads weights, 1 loads optimizer states.
+
+        Returns:
+            A tuple of ``load_path`` and ``client_state`` (see ``load_checkpoint``).
+
+        The original synchronous ``load_checkpoint`` API is preserved unchanged.
+        """
+        if stage not in (0, 1):
+            raise ValueError(f"Invalid stage {stage}: stage must be 0 (weights) or 1 (optimizer states).")
+
+        if stage == 0:
+            if tag is None:
+                latest_tag = "latest_universal" if self.load_universal_checkpoint() else "latest"
+                latest_path = os.path.join(load_dir, latest_tag)
+                if os.path.isfile(latest_path):
+                    with open(latest_path, "r") as fd:
+                        tag = fd.read().strip()
+
+            load_path, client_states = self.load_checkpoint(load_dir,
+                                                            tag=tag,
+                                                            load_module_strict=load_module_strict,
+                                                            load_optimizer_states=False,
+                                                            load_lr_scheduler_states=load_lr_scheduler_states,
+                                                            load_module_only=False,
+                                                            custom_load_fn=custom_load_fn)
+
+            if load_path is None:
+                self._staged_checkpoint_state = None
+                return None, None
+
+            ctx = {
+                'load_dir': load_dir,
+                'tag': tag,
+                'load_path': load_path,
+                'client_state': client_states,
+                'optimizer_done': False,
+                'error': None,
+                'async_thread': None,
+            }
+            # A previous staged load must not still be running in the background.
+            if self._staged_checkpoint_state is not None:
+                prev_thread = self._staged_checkpoint_state.get('async_thread')
+                if prev_thread is not None and prev_thread.is_alive():
+                    prev_thread.join()
+            self._staged_checkpoint_state = ctx
+
+            if self._async_load_enabled():
+                ctx['async_thread'] = threading.Thread(target=self._run_staged_optimizer_load,
+                                                       args=(ctx, ),
+                                                       name="deepspeed-async-optimizer-load",
+                                                       daemon=True)
+                ctx['async_thread'].start()
+                logger.info(
+                    f"[rank={dist.get_rank()}] Weights loaded; optimizer states are being loaded asynchronously in the background."
+                )
+
+            return load_path, client_states
+
+        return self._load_optimizer_states_staged()
+
+    def wait_for_optimizer_states(self):
+        """
+        Block until the optimizer states requested via
+        ``load_checkpoint_stage(..., stage=0)`` are ready.
+
+        With async loading enabled this waits for the background load started
+        by ``stage=0``. With async loading disabled (or when the checkpoint
+        engine does not support it), this performs the ``stage=1`` load
+        synchronously if it has not been done yet. Safe to call when no staged
+        load was started (returns ``(None, None)``).
+
+        Returns:
+            A tuple of ``load_path`` and ``client_state`` (see ``load_checkpoint``).
+        """
+        if self._staged_checkpoint_state is None:
+            return None, None
+        return self._load_optimizer_states_staged()
+
+    def _async_load_enabled(self):
+        config = getattr(self._config, 'datastates_config', None)
+        async_load = bool(getattr(config, 'async_load', False))
+        engine_supports = bool(
+            getattr(self.checkpoint_engine, 'supports_async_load', lambda: False)()) \
+            if self.checkpoint_engine is not None else False
+        return async_load and engine_supports
+
+    def _run_staged_optimizer_load(self, ctx):
+        try:
+            self._load_optimizer_states_impl(ctx['load_dir'], ctx['tag'], ctx['client_state'])
+            ctx['optimizer_done'] = True
+        except Exception as exc:
+            ctx['error'] = exc
+
+    def _load_optimizer_states_staged(self):
+        ctx = self._staged_checkpoint_state
+        if ctx is None:
+            raise RuntimeError("Optimizer states cannot be loaded: call load_checkpoint_stage(..., stage=0) first.")
+
+        thread = ctx.get('async_thread')
+        if thread is not None and thread.is_alive():
+            thread.join()
+
+        if ctx.get('error') is not None:
+            exc = ctx.pop('error')
+            raise exc
+
+        if not ctx.get('optimizer_done'):
+            try:
+                self._load_optimizer_states_impl(ctx['load_dir'], ctx['tag'], ctx['client_state'])
+            except Exception as exc:
+                ctx['error'] = exc
+                raise
+            ctx['optimizer_done'] = True
+
+        return ctx['load_path'], ctx['client_state']
+
+    def _load_optimizer_states_impl(self, load_dir, tag, client_state):
+        if self.zero_optimization():
+            if self.zero_nvme_offload_optimizer():
+                from shutil import copytree, disk_usage
+                rank = self.local_rank if self.use_node_local_storage() else self.global_rank
+                rank_dir = "rank" + dp_index_to_str(rank)
+                offload_dir = self.optimizer.optimizer_swapper.swap_folder
+                offload_ckpt_dir = os.path.join(load_dir, tag, "offloaded_tensors", rank_dir)
+                _, _, free = disk_usage(offload_dir)
+                logger.info(
+                    f"Copying NVMe offload checkpoint from {offload_ckpt_dir} to {offload_dir}, {free / 1e9:,.2f} GB free on target filesystem..."
+                )
+                copytree(offload_ckpt_dir, offload_dir, dirs_exist_ok=True)
+                _, _, free = disk_usage(offload_dir)
+                logger.info(f"Copying complete! {free / 1e9:,.2f} GB free on target filesystem")
+                self.optimizer.reset_swap_buffers()
+            else:
+                if self._optimizer_has_ckpt_event_prologue():
+                    self.optimizer.checkpoint_event_prologue()
+                success = self._load_zero_checkpoint(load_dir, tag, load_optimizer_states=True)
+                if not success:
+                    self.optimizer._restore_from_bit16_weights()
+                if self._optimizer_has_ckpt_event_epilogue():
+                    self.optimizer.checkpoint_event_epilogue()
+        elif self.optimizer is not None and not (self.zero_optimization() or self.bfloat16_enabled()):
+            if self.has_moe_layers:
+                largest_group_name = groups._get_max_expert_size_name()
+                expp_rank = groups._get_expert_parallel_rank(largest_group_name)
+                optim_load_path = self._get_optimizer_ckpt_name(load_dir, tag, expp_rank)
+                optim_checkpoint = self.checkpoint_engine.load(optim_load_path, map_location=torch.device('cpu'))
+            else:
+                optim_checkpoint = None
+                if client_state is not None and client_state.get('optimizer') is not None:
+                    optim_checkpoint = {'optimizer': client_state['optimizer']}
+            if optim_checkpoint is not None:
+                if self.fp16_enabled() or self.bfloat16_enabled():
+                    self.optimizer.load_state_dict(optim_checkpoint['optimizer'], load_optimizer_states=True)
+                self.optimizer.load_state_dict(optim_checkpoint['optimizer'])
+        if self.load_universal_checkpoint() and not self.zero_optimization_partition_weights() \
+                and self.optimizer is not None:
+            self.optimizer.update_lp_params()
 
     def _load_checkpoint(self,
                          load_dir,
