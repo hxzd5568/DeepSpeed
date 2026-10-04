@@ -3034,6 +3034,13 @@ class DeepSpeedEngine(Module):
         bf16_mode = self.bfloat16_enabled()
         return self._get_rank_zero_ckpt_name(checkpoints_path, tag, mp_rank, pp_rank, bf16_mode)
 
+    def _get_zero3_fp16_weights_name(self, checkpoints_path, tag):
+        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        pp_rank = dist.get_rank(group=self.optimizer.dp_process_group)
+        bf16_mode = self.bfloat16_enabled()
+        file_prefix = self._get_zero_ckpt_prefix(pp_rank, bf16_mode=bf16_mode)
+        return os.path.join(checkpoints_path, str(tag), f"{file_prefix}_mp_rank_{mp_rank:02d}_fp16_weights.pt")
+
     def _get_ckpt_name(self, checkpoints_path, tag, mp_placeholder=None, pp_placeholder=None):
         if mp_placeholder is not None:
             mp_rank_str = mp_placeholder
@@ -3201,11 +3208,20 @@ class DeepSpeedEngine(Module):
 
         * ``stage=0`` loads the model weights and returns
           ``(load_path, client_state)`` exactly like ``load_checkpoint``,
-          except that optimizer states are not loaded. If ``async_load`` is
-          enabled in the DeepSpeed config and the active checkpoint engine
-          supports asynchronous loads (``checkpoint_engine.supports_async_load()``),
-          loading of the optimizer states is started in a background thread and
-          this call returns immediately.
+          except that optimizer states are not loaded. Under ZeRO-3, if the
+          checkpoint was saved with the ``async_load`` config enabled, the fp16
+          partitioned weights are read from the dedicated ``*_fp16_weights.pt``
+          file and copied straight into the partitioned parameters, without
+          touching the ``*_optim_states.pt`` files; for checkpoints saved
+          without that layout it falls back to reconstructing fp32 weights from
+          the optimizer files (slower, but correct). stage=1 later restores the
+          fp32 master weights and optimizer states from the ``*_optim_states.pt``
+          files and re-copies fp32 -> fp16, so no precision is lost overall.
+          If ``async_load`` is enabled in the DeepSpeed config and the active
+          checkpoint engine supports asynchronous loads
+          (``checkpoint_engine.supports_async_load()``), loading of the
+          optimizer states is started in a background thread and this call
+          returns immediately.
         * ``stage=1`` loads the optimizer states. When async loading is active
           it waits for the background thread; otherwise it performs the load
           synchronously. It is safe to call it more than once.
@@ -3213,6 +3229,11 @@ class DeepSpeedEngine(Module):
         Alternatively, call ``wait_for_optimizer_states()`` right before the
         first update to block until the optimizer states are ready (with async
         loading disabled, this performs the ``stage=1`` load synchronously).
+
+        Important: between ``stage=0`` and ``wait_for_optimizer_states()`` /
+        ``stage=1``, forward/backward is safe, but do **not** call
+        ``optimizer.step()`` (the fp32 master weights are only fp16 copies
+        until stage=1 restores them from the checkpoint).
 
         Arguments:
             load_dir: Required. Directory to load the checkpoint from.
@@ -3240,14 +3261,49 @@ class DeepSpeedEngine(Module):
                 if os.path.isfile(latest_path):
                     with open(latest_path, "r") as fd:
                         tag = fd.read().strip()
+                else:
+                    if self.load_universal_checkpoint():
+                        raise ValueError(f'Invalid for universal checkpoint: {latest_path} does not exist')
+                    else:
+                        logger.warning(
+                            f"Unable to find latest file at {latest_path}, if trying to load latest "
+                            "checkpoint please ensure this file exists or pass an explicit checkpoint tag when loading a checkpoint."
+                        )
+                        self._staged_checkpoint_state = None
+                        return None, None
 
-            load_path, client_states = self.load_checkpoint(load_dir,
-                                                            tag=tag,
-                                                            load_module_strict=load_module_strict,
-                                                            load_optimizer_states=False,
-                                                            load_lr_scheduler_states=load_lr_scheduler_states,
-                                                            load_module_only=False,
-                                                            custom_load_fn=custom_load_fn)
+            if self._optimizer_has_ckpt_event_prologue():
+                # Prepare for checkpoint load by ensuring all parameters are partitioned
+                self.optimizer.checkpoint_event_prologue()
+
+            # Load the weights without touching the optimizer-state files. Under
+            # ZeRO-3 the fp16 partitioned weights come straight from the
+            # dedicated *_fp16_weights.pt file (falling back to fp32
+            # reconstruction from the *_optim_states.pt files when that file
+            # does not exist), so stage=0 only reads the weight file.
+            load_path, client_states = self._load_checkpoint(load_dir,
+                                                             tag,
+                                                             load_module_strict=load_module_strict,
+                                                             load_optimizer_states=False,
+                                                             load_lr_scheduler_states=load_lr_scheduler_states,
+                                                             load_module_only=False,
+                                                             custom_load_fn=custom_load_fn,
+                                                             zero_fp32_reconstruct=False)
+
+            load_zero_checkpoint = load_path is not None and self.zero_optimization()
+            if load_zero_checkpoint and not self.zero_nvme_offload_optimizer():
+                if self.load_universal_checkpoint():
+                    success = self._load_zero_checkpoint(load_dir, tag, load_optimizer_states=False)
+                else:
+                    success = False
+                if not success:
+                    self.optimizer._restore_from_bit16_weights()
+
+            if self._optimizer_has_ckpt_event_epilogue():
+                self.optimizer.checkpoint_event_epilogue()
+
+            if self.load_universal_checkpoint() and not self.zero_optimization_partition_weights():
+                self.optimizer.update_lp_params()
 
             if load_path is None:
                 self._staged_checkpoint_state = None
@@ -3301,20 +3357,103 @@ class DeepSpeedEngine(Module):
             return None, None
         return self._load_optimizer_states_staged()
 
+    def _try_load_zero3_fp16_weights(self, load_dir, tag):
+        fp16_path = self._get_zero3_fp16_weights_name(load_dir, tag)
+        if not os.path.exists(fp16_path):
+            return None
+        logger.info(f"[rank={dist.get_rank()}] Loading fp16 partitioned weights from {fp16_path}...")
+        return self.checkpoint_engine.load(fp16_path, map_location='cpu')
+
+    def _load_zero3_fp16_partition_state_dict(self, src, dst):
+        for name, param in dst.named_parameters():
+            if name not in src or not torch.is_tensor(src[name]):
+                continue
+            saved = src[name]
+            if hasattr(param, 'ds_tensor') and param.ds_tensor is not None:
+                param.ds_tensor.data.copy_(saved.to(param.ds_tensor.device, dtype=param.ds_tensor.dtype))
+            else:
+                param.data.copy_(saved.to(param.device, dtype=param.dtype))
+        for name, buf in dst.named_buffers():
+            if name in src and torch.is_tensor(src[name]) and buf is not None:
+                buf.data.copy_(src[name].to(buf.device, dtype=buf.dtype))
+
     def _async_load_enabled(self):
         config = getattr(self._config, 'datastates_config', None)
         async_load = bool(getattr(config, 'async_load', False))
         engine_supports = bool(
             getattr(self.checkpoint_engine, 'supports_async_load', lambda: False)()) \
             if self.checkpoint_engine is not None else False
-        return async_load and engine_supports
+        zero_config = getattr(self._config, 'zero_config', None)
+        pipeline_loading = bool(getattr(zero_config, 'pipeline_loading_checkpoint', False))
+        # The background thread performs only file I/O; applying the states
+        # happens on the caller thread in wait_for_optimizer_states(). Universal
+        # checkpoints and serialized (pipeline) zero loading are not supported
+        # by the prefetch path.
+        return async_load and engine_supports and not self.load_universal_checkpoint() and not pipeline_loading
 
     def _run_staged_optimizer_load(self, ctx):
         try:
-            self._load_optimizer_states_impl(ctx['load_dir'], ctx['tag'], ctx['client_state'])
-            ctx['optimizer_done'] = True
+            ctx['prefetched'] = self._prefetch_staged_optimizer_states(ctx['load_dir'], ctx['tag'])
         except Exception as exc:
             ctx['error'] = exc
+
+    def _prefetch_staged_optimizer_states(self, load_dir, tag):
+        prefetched = {'kind': 'none'}
+        if self.zero_optimization():
+            if self.zero_nvme_offload_optimizer():
+                from shutil import copytree
+                rank = self.local_rank if self.use_node_local_storage() else self.global_rank
+                rank_dir = "rank" + dp_index_to_str(rank)
+                offload_dir = self.optimizer.optimizer_swapper.swap_folder
+                offload_ckpt_dir = os.path.join(load_dir, tag, "offloaded_tensors", rank_dir)
+                copytree(offload_ckpt_dir, offload_dir, dirs_exist_ok=True)
+                prefetched['kind'] = 'nvme'
+            else:
+                prefetched['kind'] = 'zero'
+                prefetched['zero_sd_list'] = self._get_all_zero_checkpoints(load_dir, tag)
+        elif self.optimizer is not None and not (self.zero_optimization() or self.bfloat16_enabled()):
+            if self.has_moe_layers:
+                largest_group_name = groups._get_max_expert_size_name()
+                expp_rank = groups._get_expert_parallel_rank(largest_group_name)
+                optim_load_path = self._get_optimizer_ckpt_name(load_dir, tag, expp_rank)
+                prefetched['kind'] = 'moe'
+                prefetched['optim_checkpoint'] = self.checkpoint_engine.load(optim_load_path,
+                                                                             map_location=torch.device('cpu'))
+        return prefetched
+
+    def _apply_prefetched_optimizer_states(self, load_dir, tag, prefetched, client_state):
+        kind = prefetched.get('kind', 'none') if prefetched else 'none'
+        if kind == 'zero':
+            if self.seq_dp_world_size != self.loaded_checkpoint_dp_world_size:
+                raise ZeRORuntimeException("The checkpoint being loaded used a DP " \
+                    f"world size of {self.loaded_checkpoint_dp_world_size} but the " \
+                    f"current world size is {self.seq_dp_world_size}. Automatic adjustment " \
+                    "of ZeRO's optimizer state partitioning with a new world size is not " \
+                    "currently supported.")
+            if self._optimizer_has_ckpt_event_prologue():
+                self.optimizer.checkpoint_event_prologue()
+            zero_sd_list = prefetched.get('zero_sd_list')
+            if zero_sd_list is not None:
+                self.optimizer.load_state_dict(state_dict_list=zero_sd_list,
+                                               load_optimizer_states=True,
+                                               load_from_fp32_weights=self.zero_load_from_fp32_weights(),
+                                               checkpoint_folder=None,
+                                               load_serial=None,
+                                               param_shapes=self._get_zero_param_shapes())
+            else:
+                self.optimizer._restore_from_bit16_weights()
+            if self._optimizer_has_ckpt_event_epilogue():
+                self.optimizer.checkpoint_event_epilogue()
+        elif kind == 'nvme':
+            self.optimizer.reset_swap_buffers()
+        elif kind == 'moe':
+            optim_checkpoint = prefetched.get('optim_checkpoint')
+            if optim_checkpoint is not None:
+                if self.fp16_enabled() or self.bfloat16_enabled():
+                    self.optimizer.load_state_dict(optim_checkpoint['optimizer'], load_optimizer_states=True)
+                self.optimizer.load_state_dict(optim_checkpoint['optimizer'])
+        else:
+            self._load_optimizer_states_impl(load_dir, tag, client_state)
 
     def _load_optimizer_states_staged(self):
         ctx = self._staged_checkpoint_state
@@ -3331,7 +3470,14 @@ class DeepSpeedEngine(Module):
 
         if not ctx.get('optimizer_done'):
             try:
-                self._load_optimizer_states_impl(ctx['load_dir'], ctx['tag'], ctx['client_state'])
+                if thread is not None:
+                    # async path: the file I/O ran in the background thread;
+                    # applying the states happens on the caller thread to avoid
+                    # racing with forward/backward on partitioned parameters.
+                    self._apply_prefetched_optimizer_states(ctx['load_dir'], ctx['tag'], ctx.get('prefetched'),
+                                                            ctx['client_state'])
+                else:
+                    self._load_optimizer_states_impl(ctx['load_dir'], ctx['tag'], ctx['client_state'])
             except Exception as exc:
                 ctx['error'] = exc
                 raise
@@ -3388,7 +3534,8 @@ class DeepSpeedEngine(Module):
                          load_optimizer_states=True,
                          load_lr_scheduler_states=True,
                          load_module_only=False,
-                         custom_load_fn=None):
+                         custom_load_fn=None,
+                         zero_fp32_reconstruct=None):
 
         from deepspeed.runtime.state_dict_factory import SDLoaderFactory
 
@@ -3403,10 +3550,26 @@ class DeepSpeedEngine(Module):
         if checkpoint is None:
             return None, None
 
+        if zero_fp32_reconstruct is None:
+            zero_fp32_reconstruct = self.zero_optimization_partition_weights() and not load_optimizer_states
+
+        fp16_partition_load = False
         fetch_z3_params = False
-        if self.zero_optimization_partition_weights() and not load_optimizer_states:
+        if zero_fp32_reconstruct:
             checkpoint['module'] = get_fp32_state_dict_from_zero_checkpoint(load_dir)
             fetch_z3_params = True
+        elif (self.zero_optimization_partition_weights() and not load_optimizer_states and not self.has_moe_layers
+              and not self.load_universal_checkpoint() and checkpoint.get('dp_world_size') == self.seq_dp_world_size):
+            # Staged-load fast path: if the checkpoint was saved with the async
+            # layout, the fp16 partitioned weights live in a dedicated file and
+            # can be loaded without touching the optimizer-state files.
+            fp16_weights = self._try_load_zero3_fp16_weights(load_dir, tag)
+            if fp16_weights is not None and fp16_weights.get('module') is not None:
+                checkpoint['module'] = fp16_weights['module']
+                fp16_partition_load = True
+            else:
+                checkpoint['module'] = get_fp32_state_dict_from_zero_checkpoint(load_dir)
+                fetch_z3_params = True
 
         if is_pipe_parallel:
             # Pipeline parallelism uses this to load its own checkpoint files.
@@ -3426,9 +3589,12 @@ class DeepSpeedEngine(Module):
                                                 num_experts=self.num_experts,
                                                 checkpoint_engine=self.checkpoint_engine)
         if not self.load_universal_checkpoint():
+            staged_custom_load_fn = custom_load_fn
+            if fp16_partition_load and custom_load_fn is None:
+                staged_custom_load_fn = self._load_zero3_fp16_partition_state_dict
             self.load_module_state_dict(checkpoint=checkpoint,
                                         strict=load_module_strict,
-                                        custom_load_fn=custom_load_fn,
+                                        custom_load_fn=staged_custom_load_fn,
                                         fetch_z3_params=fetch_z3_params)
 
         self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
@@ -3945,6 +4111,41 @@ class DeepSpeedEngine(Module):
 
         if self.save_non_zero_checkpoint:
             self.checkpoint_engine.save(state_dict=state, path=save_path)
+
+        # With async_load enabled under ZeRO-3, additionally persist the fp16
+        # partitioned weights in a dedicated file, so that
+        # load_checkpoint_stage(stage=0) can load the weights without reading
+        # the (much larger) optimizer-state files. The standard
+        # *_model_states.pt file is left untouched for compatibility.
+        if self.save_non_zero_checkpoint and self._zero3_async_layout_enabled():
+            fp16_state = dict(module=self._get_zero3_fp16_partition_state_dict(
+                exclude_frozen_parameters=exclude_frozen_parameters))
+            fp16_path = self._get_zero3_fp16_weights_name(save_dir, tag)
+            saveable_fp16_state = fp16_state
+            if self.checkpoint_engine.preserves_storage_sharing():
+                saveable_fp16_state = clone_tensors_for_torch_save(fp16_state)
+            self.checkpoint_engine.save(saveable_fp16_state, fp16_path)
+            log_dist(message=f'Saving fp16 partitioned weights for async load: {fp16_path}', ranks=[0])
+
+    def _zero3_async_layout_enabled(self):
+        config = getattr(self._config, 'datastates_config', None)
+        return self.zero_optimization_partition_weights() and bool(getattr(config, 'async_load', False))
+
+    def _get_zero3_fp16_partition_state_dict(self, exclude_frozen_parameters=False):
+        sd = OrderedDict()
+        for name, param in self.module.named_parameters():
+            if exclude_frozen_parameters and not param.requires_grad:
+                continue
+            if hasattr(param, 'ds_tensor') and param.ds_tensor is not None:
+                sd[name] = param.ds_tensor.detach()
+            else:
+                sd[name] = param.detach()
+        for name, buf in self.module.named_buffers():
+            if buf is not None and name not in self.module._non_persistent_buffers_set:
+                sd[name] = buf.detach()
+        if self.random_ltd_enabled():
+            sd = remove_random_ltd_state_dict(sd)
+        return sd
 
     def _get_buffer_names(self):
         buffer_names = []

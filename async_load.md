@@ -109,16 +109,17 @@ engine.wait_for_optimizer_states()          # 等价于：先确保 optimizer �
   - `tag=None`（读 latest 文件）路径通过；stage=1 未先调 stage=0 抛 `RuntimeError`；
     stage 非法值抛 `ValueError`。
   - `tests/unit/runtime/test_ds_config_dict.py` 20 项全过（config 改动无回归）。
-- 原始 `load_checkpoint` 及其余 API 完全未动，纯新增代码（+221 行）。
+- 原始 `load_checkpoint` 及其余 API 完全未动，纯新增代码。
+- Phase 1+2（ZeRO-3 权重快速加载）已实现并验证，详见下文"待办计划"章节的
+  "验证结果（Phase 1+2 已全部通过）"。
 
 ## 困难 / 注意事项
 
-1. **ZeRO-3 线程安全**：stage=1 在后台线程执行时，若配置了
-   `stage3_param_persistence_threshold`（persistent parameters），
-   `checkpoint_event_epilogue` 会在后台线程里发起 all_gather 集合通信，可能与主线程的
-   forward/backward 通信交错导致 hang/损坏。**异步模式默认面向无 persistent 参数、
-   无 `zero_config.pipeline_loading_checkpoint` 的场景**；后者在后台线程里会做
-   `dist.recv/send`，同样有风险。
+1. **ZeRO-3 线程安全（已解决）**：早期实现在后台线程里直接执行
+   `optimizer.load_state_dict`（内含 `_partition_all_parameters`），与主线程
+   forward/backward 的参数 gather 竞争（实测复现 `free_param` assertion）。
+   现已改为后台线程只做文件 I/O（预取），apply 在主线程 `wait` 中执行；
+   见"待办计划"章节"Phase 1+2（已实现）"。
 2. **ZeRO-3 时序要求**：与 `load_checkpoint` 相同，两阶段加载面向"干净"模型
    （不要在 `save_checkpoint` 后立即对同一 engine 加载）。stage=0 与 stage=1 之间
    允许跑 forward/backward（这正是异步的意义），但 stage=1 会重新分区 fp32 参数。
@@ -159,75 +160,82 @@ if self.zero_optimization_partition_weights() and not load_optimizer_states:
 stage=0 直接 `FileNotFoundError`。于是 stage=0 读了两个文件（权重文件白读 + optim
 文件全读），stage=1 又把 optim 文件读一遍——总 I/O 比同步加载还多一次。
 
-ZeRO-3 实际布局（两个文件）与体量估算（P = fp16 权重字节数）：
+**进一步实测发现（关键）**：ZeRO-3 的 `*_model_states.pt` 里 `module` 权重是
+**空占位 tensor（shape [0]）**——分区状态下 `param.data` 被 `free_param` 释放，
+真实权重只存在于 `*_optim_states.pt`（fp32 flat groups）。经典同步加载的权重恢复
+完全来自 optim 文件的 fp32（`_rigid_load_state_dict` 恢复 fp32 再拷回 fp16）。
+因此"只改 load、不动 save"对 z3 是**不可能的**：model 文件里根本没有权重可读。
 
-| 文件 | 内容 | 大小 |
+| 文件 | 内容 | 大小（P = fp16 权重字节数） |
 |------|------|------|
-| `*_model_states.pt` | fp16 分区权重 + 少量元数据 | ~1P |
+| `*_model_states.pt` | 空占位 + buffers + 元数据 | ~0 |
 | `*_optim_states.pt` | fp32 master（2P）+ Adam moments（4P）+ ds_config | ~6P |
 
-ZeRO-2 / 非 ZeRO 不受影响（`zero_optimization_partition_weights()` 为 False，
-不触发 fp32 重建），stage=0 本就只读权重文件。
+ZeRO-2 / 非 ZeRO 不受影响（model 文件里有真实 fp16 权重，stage=0 本就只读权重文件）。
 
 ### 计划（三阶段，可独立落地）
 
 #### Phase 1：load 侧修复（不改 save，最小改动）
 
-思路：z3 的 model 文件里本来就有 fp16 分区权重，stage=0 直接用它，不碰 optim
-文件。stage=1 恢复 fp32+optimizer 后，z3 `_rigid_load_state_dict` 会把 fp32 拷回
-fp16，因此 stage=0 用 fp16 精度启动 forward/backward **没有最终精度损失**。
+~~思路：z3 的 model 文件里本来就有 fp16 分区权重，stage=0 直接用它，不碰 optim
+文件。~~（已证伪：z3 model 文件是空占位，见上文诊断。）实际落地为 Phase 1+2 合并：
 
-- `_load_checkpoint` 新增内部参数 `zero_fp32_reconstruct: bool = None`：
-  - `None`（默认）→ 行为与现在完全一致，`load_checkpoint` 原 API 零影响；
-  - `False` → 跳过 `get_fp32_state_dict_from_zero_checkpoint`，直接从
-    `checkpoint['module']`（fp16 分区权重）走标准 `load_module_state_dict` 路径
-    （`fetch_z3_params=False`，与同步加载的 z3 权重路径一致）。
-- `load_checkpoint_stage(stage=0)` 不再调 `load_checkpoint(load_optimizer_states=False)`，
-  改为直接调 `_load_checkpoint(..., load_optimizer_states=False,
-  zero_fp32_reconstruct=False)`，并复刻 load_checkpoint 的
-  prologue / `_restore_from_bit16_weights` / epilogue 包裹逻辑。
-- stage=1 / 后台线程逻辑完全不动。
+#### Phase 1+2（已实现）：save 侧写 fp16 权重文件 + load 侧直读
 
-收益：stage=0 I/O 从 ~7P 降到 ~1P，forward/backward 提前约 6P 的 I/O 时间开始，
-optim 文件读取与计算在后台重叠。
+**save 侧**（用户提出的思路——save 看到 `async_load` 且 zero3 时做设定）：
+- 新增 `_zero3_async_layout_enabled()`：`async_load=True && zero3` 时生效；
+- `_save_checkpoint` 在原文件**之外**额外把 fp16 分区权重（`param.ds_tensor`，
+  含 buffers）写到独立文件 `*_fp16_weights.pt`；原 `*_model_states.pt`、
+  `*_optim_states.pt` 保持原样 → 旧工具/旧版本完全兼容。
 
-#### Phase 2：save 侧配合（可选的 save 函数）
+**load 侧**：
+- `_load_checkpoint` 新增内部参数 `zero_fp32_reconstruct`（默认 None=原行为）；
+- stage=0 走快速路径：检测 `*_fp16_weights.pt` 存在且 dp world size 一致时，
+  只读该文件（P 字节），用 `_load_zero3_fp16_partition_state_dict` 把分区切片
+  直接拷进 `param.ds_tensor`（无集合通信）；
+- 旧 checkpoint（无 fp16 文件）自动 fallback 到 fp32 重建路径（慢但正确）。
 
-标准布局下 Phase 1 已够用；以下场景需要 save 配合：casync engine 的
-`coalition_save` 把权重+optimizer 合成一个大文件时；或想进一步缩小权重文件。
-设计：
+**异步线程安全修复**（实现过程中发现并解决）：z3 下后台线程若直接执行
+`optimizer.load_state_dict`（内含 `_partition_all_parameters`），会与主线程
+forward/backward 的参数 gather 竞争（实测复现 `free_param` assertion 崩溃）。
+现改为：**后台线程只做文件 I/O**（`_prefetch_staged_optimizer_states`，预取
+zero optim state dicts / NVMe copytree / MoE optim 文件），
+**apply 在主线程的 wait 里执行**（`_apply_prefetched_optimizer_states`，
+含 prologue/epilogue）。universal checkpoint 与 `pipeline_loading_checkpoint`
+场景自动禁用异步（退化为同步两阶段）。
 
-- 新增 `save_checkpoint(..., async_layout=None)` 参数（默认 None=跟随 `async_load`
-  配置，原 API 不变）；当 `async_layout=True && zero3` 时：
-  1. 权重仍写 `*_model_states.pt`，但**剥离非权重字段**
-     （lr_scheduler / data_sampler / ds_config 等移到 `*_meta.pt`），
-     权重文件只留 `module` + `buffer_names` + `param_shapes`；
-  2. tag 目录下写 manifest `weights_layout.json`：权重文件路径、fp16 标记、
-     meta/optim 文件列表；
-  3. engine 支持时把权重单独 coalition 成一个文件，供 `split_load` 只解压权重。
-- load 侧按 manifest 精确只读权重文件；无 manifest 的旧 checkpoint 自动 fallback
-  到 Phase 1 行为。
-
-#### Phase 3：进阶（可选）
+#### Phase 3：进阶（可选，未实现）
 
 权重文件改存 raw fp16 flat buffer + offset 索引（免 pickle），stage=0 用
 `torch.frombuffer` + 单次 GPU memcpy，接近零反序列化；若 casync engine 提供
 mmap / lazy load 则直接对接。
 
-### 验证方案
+### 验证结果（Phase 1+2 已全部通过）
 
-1. **负向测试**：改名 optim 文件后 stage=0 必须成功且 forward 输出正确
-   （证明不碰 optim 文件）——当前失败，修完应通过；
-2. **计时对比**：stage=0 耗时 ≈ 只读 model 文件耗时；总 I/O == 同步加载
-   （不再双读 optim 文件）；
-3. **一致性**：wait 后 optimizer step 数、再训一步的权重与经典
-   `load_checkpoint` 逐位一致（沿用现有 z3 测试）。
+1. **负向测试**：改名 optim 文件后 stage=0 成功、forward diff = 0（证明只读
+   fp16 权重文件）；wait 恢复 optim 文件后正常完成；
+2. **一致性**：z3 `async_load=True` 两阶段加载 + 再训一步 vs 经典
+   `load_checkpoint` + 再训一步，权重逐位一致（max diff = 0）；重复 3 次稳定；
+3. **兼容性**：旧布局 checkpoint（无 fp16 文件）在新代码下自动走 fp32
+   fallback；新布局 checkpoint 用经典 `load_checkpoint` 加载不受影响；
+4. **回归**：z3/z2/z0 × async 开/关 全过；`tests/unit/runtime/test_ds_config_dict.py`
+   20/20。
 
 ### 风险
 
 1. stage=0 → wait 之间**禁止** `step()`（此窗口内 fp32 只是 fp16 的拷贝，
    精度有损）；forward/backward 无碍；
 2. stage=0 需 pristine（分区状态）模型，与 `load_checkpoint` 约束相同；
-3. 后台线程的 z3 集合通信风险（persistent params 的 all_gather、
-   `pipeline_loading_checkpoint` 的 send/recv）与上文"困难/注意事项"一致；
-4. manifest 与旧 checkpoint 的兼容需在 load 侧做 fallback 检测。
+3. **线程安全**：后台线程仅做 I/O（CPU 读取 / engine 内部流），apply 在主线程
+   wait 中执行，已消除 z3 分区竞争；但 engine 的 `split_load` 在后台线程里
+   `torch.cuda.empty_cache()` 等操作与主线程计算共享 allocator，极端情况下
+   有显存抖动，需在目标集群验证；
+4. **新布局 checkpoint 的旧版本兼容**：`*_fp16_weights.pt` 是额外文件，旧版本
+   loader 会忽略它（标准文件未变），因此完全兼容；反之旧布局 checkpoint 在新
+   代码下也正常（fallback）；
+5. `async_load=True` 保存会多写一个 fp16 权重文件（约 P 字节，与 optim 文件
+   相比可忽略）；
+6. fp16 权重文件的 partition 布局与 DP world size 绑定（与 ZeRO optim 文件
+   相同）；world size 变化时自动 fallback 到 fp32 重建路径；
+7. universal checkpoint / pipeline loading checkpoint 不支持异步预取
+   （自动退化为同步两阶段）。
