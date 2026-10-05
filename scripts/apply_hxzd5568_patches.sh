@@ -1,5 +1,5 @@
 #!/bin/bash
-# Apply hxzd5568's 6 commits (casync engine + fixes) to an installed deepspeed
+# Apply hxzd5568's commits (casync engine + two-stage load) to an installed deepspeed
 #
 # Usage:
 #   bash apply_hxzd5568_patches.sh                          # auto-detect from pip
@@ -27,23 +27,25 @@ echo "[INFO] deepspeed installed at: $SITE_PACKAGES"
 
 # --- generate patch from git repo ---
 BASE_COMMIT=$(git -C "$REPO_ROOT" rev-parse cde7b599^)
-TARGET_COMMIT=632f16c6
+TARGET_COMMIT=84fea7f5
 PATCH_FILE=$(mktemp -t deepspeed_hxzd5568_patch.XXXXXX)
 
 echo "[INFO] generating patch from $BASE_COMMIT..$TARGET_COMMIT ..."
-git -C "$REPO_ROOT" diff "$BASE_COMMIT".."$TARGET_COMMIT" > "$PATCH_FILE"
+git -C "$REPO_ROOT" diff "$BASE_COMMIT".."$TARGET_COMMIT" -- deepspeed/ > "$PATCH_FILE"
 
 echo "[INFO] applying patch (dry-run first)..."
 # dry-run
 if patch -d "$SITE_PACKAGES" -p1 --dry-run < "$PATCH_FILE"; then
     echo "[INFO] dry-run OK, applying..."
     patch -d "$SITE_PACKAGES" -p1 < "$PATCH_FILE"
-    echo "[INFO] done. 5 files patched:"
+    echo "[INFO] done. 7 files patched:"
     echo "        deepspeed/datastates/config.py"
     echo "        deepspeed/runtime/checkpoint_engine/casync_checkpoint_engine.py (new)"
+    echo "        deepspeed/runtime/checkpoint_engine/checkpoint_engine.py"
     echo "        deepspeed/runtime/checkpoint_engine/datastates_checkpoint_engine.py"
     echo "        deepspeed/runtime/checkpoint_engine/torch_checkpoint_engine.py"
     echo "        deepspeed/runtime/checkpoint_engine/utils.py"
+    echo "        deepspeed/runtime/engine.py"
 else
     echo "[ERROR] dry-run failed. Installed deepspeed may already be patched or incompatible."
     rm -f "$PATCH_FILE"
