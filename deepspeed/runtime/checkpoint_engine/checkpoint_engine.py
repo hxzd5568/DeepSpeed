@@ -62,6 +62,12 @@ class CheckpointEngine(ABC):
         """
         return False
 
+    def supports_hot_backup(self):
+        """Whether this engine keeps an in-memory hot backup of the model
+        weights after save (created on the engine side, see ``hot_weights``).
+        """
+        return False
+
     def set_commit_info(self, info: CheckpointCommitInfo):
         pass
 

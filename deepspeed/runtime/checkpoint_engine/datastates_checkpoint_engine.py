@@ -32,8 +32,8 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         self.commit_info = info
         return None
 
-    def save(self, state_dict, path: str):
-        self.ckpt_engine.save(state_dict, path)
+    def save(self, state_dict, path: str, hot_backup=False):
+        self.ckpt_engine.save(state_dict, path, hot_backup=hot_backup)
         # return self.ckpt_engine.save(state_dict, path)
 
     def load(self, path: str, map_location=None):
@@ -59,6 +59,9 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         return True
 
     def supports_async_load(self):
+        return True
+
+    def supports_hot_backup(self):
         return True
 
     def preserves_storage_sharing(self):

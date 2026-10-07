@@ -3147,6 +3147,21 @@ class DeepSpeedEngine(Module):
                     )
                     return None, None
 
+        # With hot_weights enabled, default to the two-stage load path: the
+        # weights (stage 0) come straight from the checkpoint engine's in-memory
+        # hot region, and the optimizer states (stage 1) are loaded afterwards
+        # (asynchronously in the background when async_load is also enabled).
+        if self._hot_weights_default_two_stage(load_module_only):
+            load_path, client_state = self.load_checkpoint_stage(load_dir,
+                                                                 tag=tag,
+                                                                 load_module_strict=load_module_strict,
+                                                                 load_lr_scheduler_states=load_lr_scheduler_states,
+                                                                 custom_load_fn=custom_load_fn,
+                                                                 stage=0)
+            if load_optimizer_states:
+                load_path, client_state = self.wait_for_optimizer_states()
+            return load_path, client_state
+
         if self._optimizer_has_ckpt_event_prologue():
             # Prepare for checkpoint load by ensuring all parameters are partitioned
             self.optimizer.checkpoint_event_prologue()
@@ -3562,7 +3577,9 @@ class DeepSpeedEngine(Module):
               and not self.load_universal_checkpoint() and checkpoint.get('dp_world_size') == self.seq_dp_world_size):
             # Staged-load fast path: if the checkpoint was saved with the async
             # layout, the fp16 partitioned weights live in a dedicated file and
-            # can be loaded without touching the optimizer-state files.
+            # can be loaded without touching the optimizer-state files. With the
+            # hot_weights option the checkpoint engine may serve that file from
+            # its in-memory hot region transparently.
             fp16_weights = self._try_load_zero3_fp16_weights(load_dir, tag)
             if fp16_weights is not None and fp16_weights.get('module') is not None:
                 checkpoint['module'] = fp16_weights['module']
@@ -4110,26 +4127,66 @@ class DeepSpeedEngine(Module):
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
         if self.save_non_zero_checkpoint:
-            self.checkpoint_engine.save(state_dict=state, path=save_path)
+            # Under ZeRO-3 the model-states file holds only empty placeholders;
+            # the hot-weights capture applies to the fp16 partition file below.
+            if self._hot_backup_requested() and not self.zero_optimization_partition_weights():
+                self.checkpoint_engine.save(state_dict=state, path=save_path, hot_backup=True)
+            else:
+                self.checkpoint_engine.save(state_dict=state, path=save_path)
 
-        # With async_load enabled under ZeRO-3, additionally persist the fp16
-        # partitioned weights in a dedicated file, so that
+        # With async_load or hot_weights enabled under ZeRO-3, additionally
+        # persist the fp16 partitioned weights in a dedicated file, so that
         # load_checkpoint_stage(stage=0) can load the weights without reading
         # the (much larger) optimizer-state files. The standard
         # *_model_states.pt file is left untouched for compatibility.
-        if self.save_non_zero_checkpoint and self._zero3_async_layout_enabled():
+        if self.save_non_zero_checkpoint and self._zero3_fp16_layout_enabled():
             fp16_state = dict(module=self._get_zero3_fp16_partition_state_dict(
                 exclude_frozen_parameters=exclude_frozen_parameters))
             fp16_path = self._get_zero3_fp16_weights_name(save_dir, tag)
             saveable_fp16_state = fp16_state
             if self.checkpoint_engine.preserves_storage_sharing():
                 saveable_fp16_state = clone_tensors_for_torch_save(fp16_state)
-            self.checkpoint_engine.save(saveable_fp16_state, fp16_path)
+            if self._hot_backup_requested():
+                self.checkpoint_engine.save(saveable_fp16_state, fp16_path, hot_backup=True)
+            else:
+                self.checkpoint_engine.save(saveable_fp16_state, fp16_path)
             log_dist(message=f'Saving fp16 partitioned weights for async load: {fp16_path}', ranks=[0])
 
-    def _zero3_async_layout_enabled(self):
+    def _zero3_fp16_layout_enabled(self):
         config = getattr(self._config, 'datastates_config', None)
-        return self.zero_optimization_partition_weights() and bool(getattr(config, 'async_load', False))
+        if not self.zero_optimization_partition_weights():
+            return False
+        return bool(getattr(config, 'async_load', False)) or bool(getattr(config, 'hot_weights', False))
+
+    def _hot_backup_requested(self):
+        config = getattr(self._config, 'datastates_config', None)
+        if not bool(getattr(config, 'hot_weights', False)):
+            return False
+        if not self.zero_optimization():
+            logger.warning("hot_weights requires ZeRO (stage 0-3); hot backup disabled.")
+            return False
+        if self.has_moe_layers or isinstance(self.module, PipelineModule):
+            logger.warning("hot_weights does not support MoE/pipeline parallelism; hot backup disabled.")
+            return False
+        if self.load_universal_checkpoint() or self.zero_nvme_offload_optimizer():
+            logger.warning("hot_weights does not support universal checkpoint/NVMe offload; hot backup disabled.")
+            return False
+        return bool(getattr(self.checkpoint_engine, 'supports_hot_backup', lambda: False)())
+
+    def _hot_weights_default_two_stage(self, load_module_only):
+        """Whether ``load_checkpoint`` should default to the two-stage load path
+        when ``hot_weights`` is enabled (weights from the engine's hot region,
+        optimizer states afterwards). Mirrors the save-side gate: stages 1-3
+        only, since under ZeRO-0/plain-fp16 the model file embeds the optimizer
+        states and the hot backup is disabled."""
+        if load_module_only:
+            return False
+        config = getattr(self._config, 'datastates_config', None)
+        if not bool(getattr(config, 'hot_weights', False)):
+            return False
+        if not self.zero_optimization():
+            return False
+        return bool(getattr(self.checkpoint_engine, 'supports_hot_backup', lambda: False)())
 
     def _get_zero3_fp16_partition_state_dict(self, exclude_frozen_parameters=False):
         sd = OrderedDict()

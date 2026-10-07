@@ -66,9 +66,9 @@ class CasyncEngine(CheckpointEngine):
         self.commit_info = info
         return None
 
-    def save(self, state_dict, path: str):
+    def save(self, state_dict, path: str, hot_backup=False):
         # return self.ckpt_engine.coalition_save(state_dict, path)
-        self.ckpt_engine.coalition_save(state_dict, path)
+        self.ckpt_engine.coalition_save(state_dict, path, hot_backup=hot_backup)
 
     def load(self, path: str, map_location=None):
         return self.ckpt_engine.split_load(path, map_location)
@@ -94,6 +94,9 @@ class CasyncEngine(CheckpointEngine):
         return True
 
     def supports_async_load(self):
+        return True
+
+    def supports_hot_backup(self):
         return True
 
     def preserves_storage_sharing(self):

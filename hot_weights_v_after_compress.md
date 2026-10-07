@@ -371,17 +371,25 @@ train 10 steps -> save_checkpoint -> wait(True) 落盘确认 + hot promote
 -> 再 train 2 steps 验证
 ```
 
-实测（compcheck, Qwen1.5-1.8B, ZeRO-2, 4×4090）：
+实测（compcheck, Qwen1.5-1.8B, ZeRO-2, 4×4090, grad_accum=16，与 two_stage
+参考同配置；窗口 = 16 个真实 fwd/bwd 微批）：
 
-| 变体 | max stall |
-|------|-----------|
-| hot=1 | **3.426s**（3 次复测稳定；权重阶段 call 仅 0.44s，4 卡共享段全部命中） |
-| hot=0 | **3.929s** |
+| 指标 | hot=1 | hot=0 |
+|------|-------|-------|
+| classic 同步墙钟 (max) | 3.454s | 3.356s |
+| stage0 权重就绪 (max) | **0.525s** | 1.271s |
+| 首个 step 残余 wait (call) | ~0.002s | ~0.002s |
+| wait+drain（apply 排空，max） | 0.532s | 0.534s |
+| **experienced GPU stall (stage0+wait+drain)** | **1.058s** | **1.805s** |
 
-hot 快 ~0.5s（13%）。stage0 完整墙钟含 barrier 对 optimizer 相关 GPU 工作的排空
-（两阶段路径固有），非热备开销。遇到的问题与修复记录于
-`ddp1/hot_bench/results/stall_ab_report.md`（含 decoupled 引擎需显式
-`wait(True)` 才 promote、读端注册开销、跨运行残留段防护等）。
+**hot 比 nonhot 少 0.75s（~41%）**，全部来自权重阶段（0.53s 共享段直读，4 卡
+全命中 vs 1.27s 磁盘）；optimizer 加载在 16-micro 窗口内完全隐藏（call ~2ms，
+剩余 ~0.35-0.53s 为主线程 apply 的 GPU 排空，两变体相同）。测量说明：stage0
+后无 barrier（fwd/bwd 梯度累加无需跨卡同步；barrier 的 NCCL all-reduce 会与
+async 后台预取线程的 GPU 流水线串行化、虚增 ~2s）。注意 ga=1 时窗口 backward
+会崩于 `independent_gradient_partition_epilogue` 的 `zip(None, ...)`（ga=1 下
+每个 backward 都是边界），与参考一致的 ga=16 无此问题。问题与修复记录于
+`ddp1/hot_bench/results/stall_ab_report.md`。
 
 
 ## 九、风险与边界

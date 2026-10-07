@@ -13,6 +13,8 @@ CASYNC_CHECKPOINTING = "casync_ckpt"
 DATASTATES_CHECKPOINTING_ENABLED = False
 ASYNC_LOAD = "async_load"
 ASYNC_LOAD_DEFAULT = False
+HOT_WEIGHTS = "hot_weights"
+HOT_WEIGHTS_DEFAULT = False
 
 
 class DeepSpeedDataStatesConfig(DeepSpeedConfigObject):
@@ -34,3 +36,10 @@ class DeepSpeedDataStatesConfig(DeepSpeedConfigObject):
         self.async_load = param_dict.get(ASYNC_LOAD, ASYNC_LOAD_DEFAULT)
         if isinstance(self.config, dict) and ASYNC_LOAD in self.config:
             self.async_load = self.config.get(ASYNC_LOAD, self.async_load)
+
+        # Controls whether the checkpoint engine keeps an in-memory hot backup of
+        # the model weights after save, so that a subsequent load can restore the
+        # weights without disk I/O. Same key placement rules as async_load.
+        self.hot_weights = param_dict.get(HOT_WEIGHTS, HOT_WEIGHTS_DEFAULT)
+        if isinstance(self.config, dict) and HOT_WEIGHTS in self.config:
+            self.hot_weights = self.config.get(HOT_WEIGHTS, self.hot_weights)
