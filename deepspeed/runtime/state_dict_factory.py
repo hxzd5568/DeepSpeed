@@ -52,7 +52,18 @@ class SDLoaderBase(ABC):
         self.ckpt_list = ckpt_list
         self.version = version
         self.checkpoint_engine = TorchCheckpointEngine() if checkpoint_engine is None else checkpoint_engine
+        self._cached_sd = None
+        self._cached_path = None
         self.check_ckpt_list()
+
+    def _load_ckpt(self, path, map_location):
+        if self._cached_path == path and self._cached_sd is not None:
+            sd = self._cached_sd
+            self._cached_sd = None
+            self._cached_path = None
+            logger.info(f"reusing checkpoint already read for mp_world_size check: {path}")
+            return sd
+        return self.checkpoint_engine.load(path, map_location=map_location)
 
     def load(self,
              mp_world_size,
@@ -94,7 +105,7 @@ class SDLoaderBase(ABC):
         if num_ckpt == mp_world_size:
             assert os.path.exists(load_path)
             #logger.info(f'rank: {mp_rank} loading checkpoint: {load_path}')
-            sd = self.checkpoint_engine.load(load_path, map_location=lambda storage, \
+            sd = self._load_ckpt(load_path, map_location=lambda storage, \
                 loc: storage)
 
             if quantize:
@@ -120,7 +131,7 @@ class SDLoaderBase(ABC):
         ckpt_list = [self.ckpt_list[i] for i in range(num_to_merge * mp_rank, num_to_merge * (mp_rank + 1))]
 
         logger.info(f"mp_rank: {mp_rank}, ckpt_list: {ckpt_list}")
-        sd_list = [self.checkpoint_engine.load(ckpt, map_location=lambda storage, loc: storage) for ckpt in ckpt_list]
+        sd_list = [self._load_ckpt(ckpt, map_location=lambda storage, loc: storage) for ckpt in ckpt_list]
         return sd_list
 
     def get_split_state_dict(self, mp_world_size, mp_rank):
@@ -133,7 +144,7 @@ class SDLoaderBase(ABC):
 
         logger.info(f"mp_rank: {mp_rank}, ckpt_list: {self.ckpt_list[ckpt_index]}, offset: {ckpt_offset}")
 
-        sd = self.checkpoint_engine.load(self.ckpt_list[ckpt_index], map_location=lambda storage, loc: storage)
+        sd = self._load_ckpt(self.ckpt_list[ckpt_index], map_location=lambda storage, loc: storage)
 
         return sd, num_to_split, ckpt_offset
 
@@ -173,6 +184,9 @@ class SDLoaderBase(ABC):
         if 'mp_world_size' in sd.keys():
             assert len(self.ckpt_list) == sd[
                 'mp_world_size'], f"checkpoint count {len(self.ckpt_list)} is different from saved mp_world_size {sd['mp_world_size']}"
+
+        self._cached_sd = sd
+        self._cached_path = self.ckpt_list[0]
 
     @abstractmethod
     def merge_state_dict(self, mp_world_size, mp_rank, quantize, quantize_bits, groups, mlp_extra_grouping):
