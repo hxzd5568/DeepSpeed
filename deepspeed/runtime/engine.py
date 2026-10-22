@@ -3560,7 +3560,25 @@ class DeepSpeedEngine(Module):
         is_pipe_parallel = isinstance(self.module, PipelineModule)
 
         mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
-        load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
+        rank0_bcast_weights = (not self.zero_optimization_partition_weights() and not is_pipe_parallel
+                               and not self.load_universal_checkpoint() and not self.has_moe_layers
+                               and custom_load_fn is None and len(ckpt_list) == self.mp_world_size
+                               and self.mp_world_size == 1 and dist.get_world_size() > 1)
+        if rank0_bcast_weights:
+            if dist.get_rank() == 0:
+                load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank,
+                                                          is_pipe_parallel=is_pipe_parallel)
+                meta_list = [None if checkpoint is None else {k: v for k, v in checkpoint.items() if k != 'module'}]
+            else:
+                load_path = ckpt_list[0]
+                checkpoint = {'module': self.module.state_dict(keep_vars=True)}
+                meta_list = [None]
+            dist.broadcast_object_list(meta_list, src=0)
+            if meta_list[0] is None:
+                return None, None
+            checkpoint.update(meta_list[0])
+        else:
+            load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
 
         if checkpoint is None:
             return None, None
@@ -3613,6 +3631,11 @@ class DeepSpeedEngine(Module):
                                         strict=load_module_strict,
                                         custom_load_fn=staged_custom_load_fn,
                                         fetch_z3_params=fetch_z3_params)
+            if rank0_bcast_weights:
+                for p in self.module.parameters():
+                    dist.broadcast(p.data, src=0)
+                for b in self.module.buffers():
+                    dist.broadcast(b.data, src=0)
 
         self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
 
