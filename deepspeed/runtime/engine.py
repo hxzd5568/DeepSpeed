@@ -2997,11 +2997,16 @@ class DeepSpeedEngine(Module):
         with deepspeed.zero.GatheredParameters(params_to_fetch, modifier_rank=0):
             module_state_dict = checkpoint['module']
             if custom_load_fn:
+
                 custom_load_fn(src=module_state_dict, dst=self.module)
+
             else:
+                print('3005')
                 self.module.load_state_dict(
                     module_state_dict,  # TODO
                     strict=strict)
+                print('3010')
+                        
 
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS, None) is not None:
             saved_frozen_params = checkpoint[FROZEN_PARAM_FRAGMENTS]
@@ -3165,8 +3170,8 @@ class DeepSpeedEngine(Module):
         if self._optimizer_has_ckpt_event_prologue():
             # Prepare for checkpoint load by ensuring all parameters are partitioned
             self.optimizer.checkpoint_event_prologue()
-
-        load_path, client_states = self._load_checkpoint(load_dir,
+        print('!!!load_dir:', load_dir)
+        load_path, client_states = self._load_checkpoint(load_dir,  #TODO, copy addr
                                                          tag,
                                                          load_module_strict=load_module_strict,
                                                          load_optimizer_states=load_optimizer_states,
@@ -3341,6 +3346,13 @@ class DeepSpeedEngine(Module):
             self._staged_checkpoint_state = ctx
 
             if self._async_load_enabled():
+                # All ranks must have their weights fully restored before the
+                # background optimizer-state reads start, otherwise the async
+                # prefetch I/O of the faster ranks would contend with (and
+                # starve) the weight read of the slowest rank, and NCCL
+                # collectives issued right after stage=0 would race with the
+                # prefetch threads' PCIe DMA traffic.
+                dist.barrier()
                 ctx['async_thread'] = threading.Thread(target=self._run_staged_optimizer_load,
                                                        args=(ctx, ),
                                                        name="deepspeed-async-optimizer-load",
@@ -3611,7 +3623,6 @@ class DeepSpeedEngine(Module):
             self._curr_ckpt_path = os.path.join(load_dir, tag)
 
         if self.has_moe_layers:
-            # print(checkpoint.keys())
             old_moe_load = False
             if not isinstance(checkpoint['num_experts'], list):
                 old_moe_load = True

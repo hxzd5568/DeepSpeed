@@ -173,7 +173,8 @@ class SDLoaderBase(ABC):
         return sd
 
     def check_ckpt_list(self):
-        #logger.info(f'checkpoint file list: {self.ckpt_list}')
+        print(f'checkpoint file list: {self.ckpt_list}')
+        logger.info(f'checkpoint file list: {self.ckpt_list}')
         assert len(self.ckpt_list) > 0
 
     @abstractmethod
