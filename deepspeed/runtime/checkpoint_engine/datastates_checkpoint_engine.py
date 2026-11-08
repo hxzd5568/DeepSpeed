@@ -32,9 +32,11 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         self.commit_info = info
         return None
 
-    def save(self, state_dict, path: str, hot_backup=False):
+    def save(self, state_dict, path: str, hot_backup=False, plain=False):
+        # This engine saves everything uncompressed (plain) already, so the
+        # ``plain`` flag of the async layout is a no-op; it is accepted for
+        # API parity with the casync engine.
         self.ckpt_engine.save(state_dict, path, hot_backup=hot_backup)
-        # return self.ckpt_engine.save(state_dict, path)
 
     def load(self, path: str, map_location=None):
         return self.ckpt_engine.load(path, map_location)
@@ -48,6 +50,15 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         return True
     def wait(self, persist=True):
         self.ckpt_engine.wait(persist=persist)
+
+    def release_hot_weights(self, paths, unlink=False):
+        """Release the hot-weights shared-memory segments for ``paths``.
+
+        Called by ``DeepSpeedEngine.release_hot_weights()`` at the end of the
+        training task: every rank drops its local mapping, and only the rank
+        passing ``unlink=True`` (rank 0) removes the segment names from
+        /dev/shm so the hot backup cannot leak across runs."""
+        self.ckpt_engine.release_hot_weights(list(paths), bool(unlink))
 
     def cleanup(self):
         self.commit(self.commit_info)

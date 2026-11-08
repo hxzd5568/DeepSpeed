@@ -67,12 +67,20 @@ class CasyncEngine(CheckpointEngine):
         self.commit_info = info
         return None
 
-    def save(self, state_dict, path: str, hot_backup=False):
-        # return self.ckpt_engine.coalition_save(state_dict, path)
-        self.ckpt_engine.coalition_save(state_dict, path, hot_backup=hot_backup)
+    def save(self, state_dict, path: str, hot_backup=False, plain=False):
+        if plain:
+            # async plain layout: optimizer states saved uncompressed so the
+            # background prefetch does only host I/O (no GPU decompression).
+            self.ckpt_engine.save_(state_dict, path, hot_backup=hot_backup)
+        else:
+            self.ckpt_engine.coalition_save(state_dict, path, hot_backup=hot_backup)
 
 
     def load(self, path: str, map_location=None):
+        if 'optim_states_plain' in path:
+            # async plain layout: restore uncompressed optimizer states
+            # (tensors reference the engine's host pool, zero GPU work).
+            return self.ckpt_engine.load(path, map_location)
         return self.ckpt_engine.split_load(path, map_location)
 
 

@@ -6,6 +6,7 @@
 import os
 import re
 import stat
+import time
 import torch
 import hashlib
 import threading
@@ -251,6 +252,7 @@ class DeepSpeedEngine(Module):
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
         self.checkpoint_engine = None
         self._staged_checkpoint_state = None
+        self._hot_weights_paths = []  # checkpoint paths hot-backed during this run
         self.optimizer = None
         self.basic_optimizer = None
         self.lr_scheduler = None
@@ -3026,10 +3028,11 @@ class DeepSpeedEngine(Module):
 
     def _get_rank_zero_ckpt_name(self, checkpoints_path, tag, mp_rank, dp_rank, bf16_mode):
         file_prefix = self._get_zero_ckpt_prefix(dp_rank, bf16_mode=bf16_mode)
+        plain_suffix = "_plain" if self._async_plain_optim_layout_enabled() else ""
         zero_ckpt_name = os.path.join(
             checkpoints_path,
             str(tag),
-            f"{file_prefix}_mp_rank_{mp_rank:02d}_optim_states.pt",
+            f"{file_prefix}_mp_rank_{mp_rank:02d}_optim_states{plain_suffix}.pt",
         )
         return zero_ckpt_name
 
@@ -3311,6 +3314,7 @@ class DeepSpeedEngine(Module):
                                                              zero_fp32_reconstruct=False)
 
             load_zero_checkpoint = load_path is not None and self.zero_optimization()
+            _t_z0 = time.time()
             if load_zero_checkpoint and not self.zero_nvme_offload_optimizer():
                 if self.load_universal_checkpoint():
                     success = self._load_zero_checkpoint(load_dir, tag, load_optimizer_states=False)
@@ -3318,6 +3322,7 @@ class DeepSpeedEngine(Module):
                     success = False
                 if not success:
                     self.optimizer._restore_from_bit16_weights()
+            _t_z1 = time.time()
 
             if self._optimizer_has_ckpt_event_epilogue():
                 self.optimizer.checkpoint_event_epilogue()
@@ -3351,8 +3356,16 @@ class DeepSpeedEngine(Module):
                 # prefetch I/O of the faster ranks would contend with (and
                 # starve) the weight read of the slowest rank, and NCCL
                 # collectives issued right after stage=0 would race with the
-                # prefetch threads' PCIe DMA traffic.
+                # prefetch threads' PCIe DMA traffic. The device sync also
+                # drains the asynchronous weight-copy kernels of
+                # load_module_state_dict, so the background load's
+                # empty_cache() can never free a block those kernels still read.
+                torch.cuda.synchronize()
+                _t_bar0 = time.time()
                 dist.barrier()
+                _t_bar1 = time.time()
+                print(f"[stage0-probe rank{dist.get_rank()}] zero_load={_t_z1 - _t_z0:.3f}s "
+                      f"barrier={_t_bar1 - _t_bar0:.3f}s", flush=True)
                 ctx['async_thread'] = threading.Thread(target=self._run_staged_optimizer_load,
                                                        args=(ctx, ),
                                                        name="deepspeed-async-optimizer-load",
@@ -3418,11 +3431,30 @@ class DeepSpeedEngine(Module):
         # by the prefetch path.
         return async_load and engine_supports and not self.load_universal_checkpoint() and not pipeline_loading
 
+    def _async_plain_optim_layout_enabled(self):
+        """async_load checkpoint layout: model weights are compressed, while the
+        optimizer-state files are saved/loaded uncompressed (plain) with a
+        ``_plain`` filename suffix. The background prefetch then performs only
+        host I/O and never touches the GPU."""
+        return self._async_load_enabled()
+
     def _run_staged_optimizer_load(self, ctx):
+        ckpt_engine = getattr(self.checkpoint_engine, 'ckpt_engine', None)
         try:
+            if ckpt_engine is not None:
+                # Tell the datastates engine that this load overlaps with
+                # forward/backward, so the decompressed tensors must stage the
+                # overflow back to pinned host memory instead of holding it on
+                # the GPU.
+                setattr(ckpt_engine, 'sync_load', 0)
+            t_pre = time.time()
             ctx['prefetched'] = self._prefetch_staged_optimizer_states(ctx['load_dir'], ctx['tag'])
+            logger.info(f"[rank={dist.get_rank()}] prefetch thread finished in {time.time() - t_pre:.3f}s")
         except Exception as exc:
             ctx['error'] = exc
+        finally:
+            if ckpt_engine is not None:
+                setattr(ckpt_engine, 'sync_load', 1)
 
     def _prefetch_staged_optimizer_states(self, load_dir, tag):
         prefetched = {'kind': 'none'}
@@ -3509,6 +3541,12 @@ class DeepSpeedEngine(Module):
                 ctx['error'] = exc
                 raise
             ctx['optimizer_done'] = True
+            if thread is not None:
+                # The prefetched state dicts (including their decompressed
+                # tensors) are no longer needed once applied; drop the
+                # reference so the memory is released instead of staying
+                # pinned until the next staged load replaces this context.
+                ctx['prefetched'] = None
 
         return ctx['load_path'], ctx['client_state']
 
@@ -3554,6 +3592,24 @@ class DeepSpeedEngine(Module):
                 and self.optimizer is not None:
             self.optimizer.update_lp_params()
 
+    def _local_p2p_enabled(self):
+        """Whether peer access (NVLink or PCIe P2P) works between all local
+        GPUs. Rank-0 read + NCCL broadcast of the shared model file is only
+        cheap when P2P is available; without it (e.g. consumer GPUs on a PCIe
+        switch) the broadcast is host-staged and every rank reads the shared
+        file itself instead."""
+        try:
+            n = torch.cuda.device_count()
+            if n < 2:
+                return False
+            for i in range(n):
+                for j in range(n):
+                    if i != j and not torch.cuda.can_device_access_peer(i, j):
+                        return False
+            return True
+        except Exception:
+            return False
+
     def _load_checkpoint(self,
                          load_dir,
                          tag,
@@ -3575,8 +3631,13 @@ class DeepSpeedEngine(Module):
         rank0_bcast_weights = (not self.zero_optimization_partition_weights() and not is_pipe_parallel
                                and not self.load_universal_checkpoint() and not self.has_moe_layers
                                and custom_load_fn is None and len(ckpt_list) == self.mp_world_size
-                               and self.mp_world_size == 1 and dist.get_world_size() > 1)
+                               and self.mp_world_size == 1 and dist.get_world_size() > 1
+                               and self._local_p2p_enabled())
+        if not self.zero_optimization_partition_weights() and dist.get_world_size() > 1:
+            log_dist(f'weights load: {"rank0+broadcast (P2P)" if rank0_bcast_weights else "all ranks read shared file (no P2P)"}',
+                     ranks=[0])
         if rank0_bcast_weights:
+            _t_sd0 = time.time()
             if dist.get_rank() == 0:
                 load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank,
                                                           is_pipe_parallel=is_pipe_parallel)
@@ -3586,11 +3647,14 @@ class DeepSpeedEngine(Module):
                 checkpoint = {'module': self.module.state_dict(keep_vars=True)}
                 meta_list = [None]
             dist.broadcast_object_list(meta_list, src=0)
+            _t_sd1 = time.time()
             if meta_list[0] is None:
                 return None, None
             checkpoint.update(meta_list[0])
         else:
+            _t_sd0 = time.time()
             load_path, checkpoint, _ = sd_loader.load(self.mp_world_size, mp_rank, is_pipe_parallel=is_pipe_parallel)
+            _t_sd1 = time.time()
 
         if checkpoint is None:
             return None, None
@@ -3610,13 +3674,28 @@ class DeepSpeedEngine(Module):
             # can be loaded without touching the optimizer-state files. With the
             # hot_weights option the checkpoint engine may serve that file from
             # its in-memory hot region transparently.
-            fp16_weights = self._try_load_zero3_fp16_weights(load_dir, tag)
-            if fp16_weights is not None and fp16_weights.get('module') is not None:
-                checkpoint['module'] = fp16_weights['module']
+            if self._async_plain_optim_layout_enabled():
+                # async plain layout: the fp16 partition dict was embedded in
+                # the model-states file and is already in checkpoint['module'].
                 fp16_partition_load = True
             else:
-                checkpoint['module'] = get_fp32_state_dict_from_zero_checkpoint(load_dir)
-                fetch_z3_params = True
+                fp16_weights = self._try_load_zero3_fp16_weights(load_dir, tag)
+                if fp16_weights is not None and fp16_weights.get('module') is not None:
+                    checkpoint['module'] = fp16_weights['module']
+                    fp16_partition_load = True
+                else:
+                    checkpoint['module'] = get_fp32_state_dict_from_zero_checkpoint(load_dir)
+                    fetch_z3_params = True
+        elif (self.zero_optimization_partition_weights() and self._async_plain_optim_layout_enabled()
+              and not self.has_moe_layers and not self.load_universal_checkpoint()):
+            # Classic (load_optimizer_states=True) load of an async plain layout
+            # checkpoint: the model-states file holds the fp16 partition dict,
+            # which load_module_state_dict cannot apply directly; apply it via
+            # the fp16-partition copy and let _load_zero_checkpoint restore the
+            # fp32 masters afterwards (mirrors the staged path). NOTE: the fp32
+            # reconstruction helper (zero_to_fp32) uses torch.load and cannot
+            # read datastates checkpoint files, so it must not be used here.
+            fp16_partition_load = True
 
         if is_pipe_parallel:
             # Pipeline parallelism uses this to load its own checkpoint files.
@@ -3638,15 +3717,25 @@ class DeepSpeedEngine(Module):
             staged_custom_load_fn = custom_load_fn
             if fp16_partition_load and custom_load_fn is None:
                 staged_custom_load_fn = self._load_zero3_fp16_partition_state_dict
+            _t_lm0 = time.time()
             self.load_module_state_dict(checkpoint=checkpoint,
                                         strict=load_module_strict,
                                         custom_load_fn=staged_custom_load_fn,
                                         fetch_z3_params=fetch_z3_params)
+            _t_lm1 = time.time()
             if rank0_bcast_weights:
+                _t_bc0 = time.time()
                 for p in self.module.parameters():
                     dist.broadcast(p.data, src=0)
                 for b in self.module.buffers():
                     dist.broadcast(b.data, src=0)
+                _t_bc1 = time.time()
+                print(f"[stage0-probe rank{dist.get_rank()}] sd_loader={_t_sd1 - _t_sd0:.3f}s "
+                      f"module_apply={_t_lm1 - _t_lm0:.3f}s bcast_weights={_t_bc1 - _t_bc0:.3f}s",
+                      flush=True)
+            else:
+                print(f"[stage0-probe rank{dist.get_rank()}] sd_loader={_t_sd1 - _t_sd0:.3f}s "
+                      f"module_apply={_t_lm1 - _t_lm0:.3f}s", flush=True)
 
         self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
 
@@ -4161,10 +4250,23 @@ class DeepSpeedEngine(Module):
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
         if self.save_non_zero_checkpoint:
-            # Under ZeRO-3 the model-states file holds only empty placeholders;
-            # the hot-weights capture applies to the fp16 partition file below.
-            if self._hot_backup_requested() and not self.zero_optimization_partition_weights():
+            # Under ZeRO-3 the model-states file normally holds only empty
+            # placeholders. With the async plain layout the fp16 partition
+            # dict is embedded here instead (compressed), so stage=0 can load
+            # the weights without touching the optimizer-state files and no
+            # dedicated *_fp16_weights.pt file is needed.
+            if self.zero_optimization_partition_weights() and self._async_plain_optim_layout_enabled():
+                state['module'] = self._get_zero3_fp16_partition_state_dict(
+                    exclude_frozen_parameters=exclude_frozen_parameters)
+            # The hot-weights capture applies to the file stage=0 actually
+            # reads: the model-states file for z1/z2 and for z3 under the
+            # async plain layout, the dedicated fp16 partition file otherwise.
+            hot_model_file = self._hot_backup_requested() and (
+                not self.zero_optimization_partition_weights()
+                or self._async_plain_optim_layout_enabled())
+            if hot_model_file:
                 self.checkpoint_engine.save(state_dict=state, path=save_path, hot_backup=True)
+                self._hot_weights_paths.append(save_path)
             else:
                 self.checkpoint_engine.save(state_dict=state, path=save_path)
 
@@ -4182,6 +4284,7 @@ class DeepSpeedEngine(Module):
                 saveable_fp16_state = clone_tensors_for_torch_save(fp16_state)
             if self._hot_backup_requested():
                 self.checkpoint_engine.save(saveable_fp16_state, fp16_path, hot_backup=True)
+                self._hot_weights_paths.append(fp16_path)
             else:
                 self.checkpoint_engine.save(saveable_fp16_state, fp16_path)
             log_dist(message=f'Saving fp16 partitioned weights for async load: {fp16_path}', ranks=[0])
@@ -4190,7 +4293,11 @@ class DeepSpeedEngine(Module):
         config = getattr(self._config, 'datastates_config', None)
         if not self.zero_optimization_partition_weights():
             return False
-        return bool(getattr(config, 'async_load', False)) or bool(getattr(config, 'hot_weights', False))
+        # The dedicated fp16_weights file is only needed for the hot_weights
+        # feature outside the async plain layout, where the fp16 partitions
+        # live inside the model-states file itself.
+        return bool(getattr(config, 'hot_weights', False)) \
+            and not self._async_plain_optim_layout_enabled()
 
     def _hot_backup_requested(self):
         config = getattr(self._config, 'datastates_config', None)
@@ -4221,6 +4328,36 @@ class DeepSpeedEngine(Module):
         if not self.zero_optimization():
             return False
         return bool(getattr(self.checkpoint_engine, 'supports_hot_backup', lambda: False)())
+
+    def release_hot_weights(self):
+        """Release the hot-weights shared-memory segments persisted by this run.
+
+        Call at the end of the training task (before the process group is
+        destroyed). All ranks exchange the exact checkpoint paths that were
+        hot-backed during this run; rank 0 then unlinks the corresponding
+        /dev/shm segment names while every rank drops its own local mapping
+        (POSIX keeps existing mappings valid after unlink, and ``shm_unlink``
+        is idempotent). Without this call the segments survive process exit on
+        abnormal termination (the C++ destructor cleanup is unreliable there)
+        and leak ~1GB x world_size per run into the node's /dev/shm.
+        """
+        if self.checkpoint_engine is None or not bool(
+                getattr(self.checkpoint_engine, 'supports_hot_backup', lambda: False)()):
+            return
+        if not hasattr(self.checkpoint_engine, 'release_hot_weights'):
+            return
+        if not dist.is_initialized():
+            return
+        local_paths = list(getattr(self, '_hot_weights_paths', []))
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local_paths)
+        all_paths = sorted({p for lst in gathered if lst for p in lst})
+        self.checkpoint_engine.release_hot_weights(all_paths,
+                                                   unlink=(dist.get_rank() == 0))
+        dist.barrier()
+        if dist.get_rank() == 0 and all_paths:
+            print(f"[hot-release rank0] unlinked {len(all_paths)} hot-weights segment(s) "
+                  f"from /dev/shm: {all_paths}", flush=True)
 
     def _get_zero3_fp16_partition_state_dict(self, exclude_frozen_parameters=False):
         sd = OrderedDict()
@@ -4382,7 +4519,10 @@ class DeepSpeedEngine(Module):
     def _save_zero_checkpoint(self, save_path, tag):
         zero_checkpoint_name = self._get_zero_ckpt_name(save_path, tag)
         zero_sd = dict(optimizer_state_dict=self.optimizer.state_dict(), ds_config=self.config, ds_version=version)
-        self.checkpoint_engine.save(zero_sd, zero_checkpoint_name)
+        if self._async_plain_optim_layout_enabled():
+            self.checkpoint_engine.save(zero_sd, zero_checkpoint_name, plain=True)
+        else:
+            self.checkpoint_engine.save(zero_sd, zero_checkpoint_name)
 
         if self.global_rank == 0:
             self._copy_recovery_script(save_path)
